@@ -1,0 +1,7 @@
+torch
+biopython
+pandas
+numpy
+scikit-learn
+tqdm
+kagglehub

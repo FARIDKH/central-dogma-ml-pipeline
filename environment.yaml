@@ -1,0 +1,13 @@
+name: protein-design
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - biopython
+  - pandas
+  - numpy
+  - scikit-learn
+  - tqdm
