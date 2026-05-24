@@ -1,81 +1,106 @@
+import os
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
+import numpy as np
 import pandas as pd
+import kagglehub
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from transformers import AutoTokenizer
 
-class ProteinDataset(Dataset):
-    def __init__(self, csv_file):
-        """
-        Loads the Kaggle dataset and sets up the amino acid vocabulary.
-        """
-        # 1. Load the data
-        # Assuming the CSV has columns: 'Sequence' and 'Subcellular_Localization'
-        self.df = pd.read_csv(csv_file)
-        
-        # 2. Define the vocabulary (Dictionary Mapping)
-        self.amino_acids = "ACDEFGHIKLMNPQRSTVWY"
-        self.aa_to_int = {aa: i+1 for i, aa in enumerate(self.amino_acids)}
-        self.aa_to_int['<PAD>'] = 0 # 0 is reserved for padding
-        
-        # 3. Create a mapping for the target labels (e.g., Nucleus -> 0)
-        self.unique_labels = self.df['Subcellular_Localization'].unique()
-        self.label_to_int = {label: i for i, label in enumerate(self.unique_labels)}
-        
-    def __len__(self):
+ESM_MODEL = "facebook/esm2_t12_35M_UR50D"
+MAX_LEN   = 510   # 512 total minus 2 special tokens (<cls> / <eos>)
+
+
+class ProteinDatasetESM(Dataset):
+    """
+    Returns raw amino acid sequence strings and integer labels.
+    The ESM tokenizer handles encoding inside the collate function,
+    so no manual amino acid → integer mapping is needed here.
+    """
+
+    def __init__(self, dataframe: pd.DataFrame, label_to_int: dict, max_len: int = MAX_LEN):
+        self.df           = dataframe.reset_index(drop=True)
+        self.label_to_int = label_to_int
+        self.max_len      = max_len
+
+    def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx):
-        """
-        Fetches one protein and converts it to integers.
-        """
-        row = self.df.iloc[idx]
-        sequence = row['Sequence']
-        label_str = row['Subcellular_Localization']
-        
-        # Convert protein string to list of integers
-        # We use .get(char, 0) to handle any weird unknown characters by treating them as padding
-        encoded_seq = [self.aa_to_int.get(char, 0) for char in sequence]
-        
-        # Convert to PyTorch tensors
-        seq_tensor = torch.tensor(encoded_seq, dtype=torch.long)
-        label_tensor = torch.tensor(self.label_to_int[label_str], dtype=torch.long)
-        
-        return seq_tensor, label_tensor
+    def __getitem__(self, idx: int):
+        row   = self.df.iloc[idx]
+        seq   = row['sequence'][:self.max_len]   # truncate before tokenizer adds special tokens
+        label = self.label_to_int[row['label']]
+        return seq, torch.tensor(label)
 
-def pad_collate(batch):
-    """
-    This function tells the DataLoader how to handle a batch of proteins 
-    that are all different lengths.
-    """
-    # Separate the sequences and the labels from the batch
-    sequences = [item[0] for item in batch]
-    labels = [item[1] for item in batch]
-    
-    # Pad the sequences to the length of the longest protein in THIS specific batch
-    # batch_first=True makes the output shape [batch_size, max_length]
-    # padding_value=0 uses our <PAD> token
-    padded_sequences = pad_sequence(sequences, batch_first=True, padding_value=0)
-    
-    # Stack the labels into a single tensor
-    labels = torch.stack(labels)
-    
-    return padded_sequences, labels
 
-# ==========================================
-# How to use it in your training loop:
-# ==========================================
-if __name__ == "__main__":
-    # 1. Instantiate the dataset
-    # (Make sure you have the kaggle csv downloaded as 'protein_data.csv')
-    dataset = ProteinDataset('protein_data.csv')
-    
-    # 2. Create the DataLoader
-    # We pass our custom 'pad_collate' function here
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=pad_collate)
-    
-    # 3. Test it out!
-    for batch_idx, (sequences, labels) in enumerate(dataloader):
-        print(f"Batch {batch_idx + 1}")
-        print(f"Sequences Shape: {sequences.shape} -> [batch_size, max_sequence_length_in_batch]")
-        print(f"Labels Shape: {labels.shape} -> [batch_size]")
-        break # Just looking at the first batch
+def make_collate_fn(tokenizer):
+    """Returns a collate function bound to the given ESM tokenizer."""
+    def esm_collate(batch):
+        seqs   = [item[0] for item in batch]
+        labels = torch.stack([item[1] for item in batch])
+        encoded = tokenizer(
+            seqs,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        return encoded['input_ids'], encoded['attention_mask'], labels
+    return esm_collate
+
+
+def prepare_data(batch_size: int = 16, max_len: int = MAX_LEN, esm_model: str = ESM_MODEL):
+    """
+    Downloads the dataset, splits it, and returns DataLoaders ready for ESM-2 fine-tuning.
+
+    Returns:
+        train_loader, val_loader, test_loader, master_label_map, class_weights
+    """
+    print("Downloading dataset...")
+    path     = kagglehub.dataset_download("lzyacht/proteinsubcellularlocalization")
+    csv_path = os.path.join(path, "1", "proteins.csv")
+    if not os.path.exists(csv_path):
+        csv_path = os.path.join(path, "proteins.csv")
+
+    df = pd.read_csv(csv_path)
+
+    # 70 / 15 / 15 stratified split
+    train_df, temp_df = train_test_split(df, test_size=0.30, random_state=42, stratify=df['label'])
+    val_df, test_df   = train_test_split(temp_df, test_size=0.50, random_state=42, stratify=temp_df['label'])
+
+    master_label_map = {label: i for i, label in enumerate(df['label'].unique())}
+
+    # ESM tokenizer + collate
+    tokenizer  = AutoTokenizer.from_pretrained(esm_model)
+    collate_fn = make_collate_fn(tokenizer)
+
+    # Datasets
+    train_dataset = ProteinDatasetESM(train_df, master_label_map, max_len)
+    val_dataset   = ProteinDatasetESM(val_df,   master_label_map, max_len)
+    test_dataset  = ProteinDatasetESM(test_df,  master_label_map, max_len)
+
+    # WeightedRandomSampler — equalise class frequency in every batch
+    # Fixes the majority-class collapse problem (cytoplasmic=1411 vs vacuolar=63)
+    label_counts   = train_df['label'].value_counts()
+    sample_weights = train_df['label'].map(lambda l: 1.0 / label_counts[l]).values
+    sampler        = WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.float),
+        num_samples=len(train_dataset),
+        replacement=True,
+    )
+
+    # sampler replaces shuffle=True for train_loader
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler,  collate_fn=collate_fn)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,    collate_fn=collate_fn)
+    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False,    collate_fn=collate_fn)
+
+    # Class weights for weighted cross-entropy loss
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(train_df['label']),
+        y=train_df['label'],
+    )
+
+    print(f"Classes: {len(master_label_map)}  |  Train: {len(train_dataset)}  Val: {len(val_dataset)}  Test: {len(test_dataset)}")
+    return train_loader, val_loader, test_loader, master_label_map, class_weights
